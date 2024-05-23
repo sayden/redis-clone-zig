@@ -14,11 +14,17 @@ pub fn main() !void {
     });
     defer listener.deinit();
 
+    var buffer: [1024]u8 = undefined;
     while (true) {
         const connection = try listener.accept();
-        try connection.stream.writeAll("+PONG\r\n");
 
         try stdout.print("accepted new connection", .{});
+
+        const conReader = connection.stream.reader();
+
+        while (try conReader.read(&buffer) > 0) {
+            try connection.stream.writeAll("+PONG\r\n");
+        }
         connection.stream.close();
     }
 }
