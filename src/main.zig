@@ -11,6 +11,9 @@ const Commands = enum {
     QUIT,
 };
 
+const CommandEnd = "\n";
+const TokenSplit = "\r\n";
+
 const KvArray = struct {
     hashmap: std.StringHashMap([]u8),
     expiries: std.StringHashMap(i64),
@@ -150,34 +153,54 @@ fn handle(connection: net.Server.Connection, kvs: *KvArray) !void {
 
     var buffer: [1024]u8 = undefined;
     var tokens: [128][]u8 = undefined;
+    var commands: [32]?[]u8 = undefined;
+    for (0..commands.len) |i| {
+        commands[i] = null;
+    }
 
-    // while (true) {
-    if (try conReader.read(&buffer) > 0) {
-        const n = try parseTokens(&buffer, &tokens);
-
-        switch (getCommands(&tokens, n)) {
-            Commands.PING => {
-                try connection.stream.writeAll("+PONG\r\n");
-            },
-            Commands.ECHO => {
-                try echoCommand(&tokens, n, connection);
-            },
-            Commands.SET => {
-                try setCommand(&tokens, n, connection, kvs);
-            },
-            Commands.GET => {
-                try getCommand(&tokens, n, connection, kvs);
-            },
-            Commands.SET_EXPIRY => {
-                try setCommand(&tokens, n, connection, kvs);
-            },
-            Commands.QUIT => {
-                quit.mutex.lock();
-                quit.quit = true;
-                connection.stream.close();
-                quit.mutex.unlock();
-            },
+    while (true) {
+        if (try conReader.read(&buffer) > 0) {
+            try splitCommands(&buffer, &commands);
+            for (commands) |command| {
+                if (command) |cmd| {
+                    const n = try parseTokens(cmd, &tokens);
+                    try handleCommand(&tokens, n, connection, kvs);
+                } else {
+                    break;
+                }
+            }
         }
+    }
+}
+
+fn splitCommands(buf: []u8, commands: *[32]?[]u8) !void {
+    var left: usize = 0;
+    var items: usize = 0;
+
+    for (buf, 0..) |c, i| {
+        if (c == '\n' and i != 0 and buf[i - 1] != '\r') {
+            commands[items] = buf[left..i];
+            items += 1;
+            left = i + 1;
+        }
+    }
+
+    commands[items] = buf[left..];
+}
+
+fn handleCommand(tokens: *[128][]u8, n: usize, connection: net.Server.Connection, kvs: *KvArray) !void {
+    switch (getCommands(tokens, n)) {
+        Commands.PING => try connection.stream.writeAll("+PONG\r\n"),
+        Commands.ECHO => try echoCommand(tokens, n, connection),
+        Commands.SET => try setCommand(tokens, n, connection, kvs),
+        Commands.GET => try getCommand(tokens, n, connection, kvs),
+        Commands.SET_EXPIRY => try setCommand(tokens, n, connection, kvs),
+        Commands.QUIT => {
+            quit.mutex.lock();
+            quit.quit = true;
+            connection.stream.close();
+            quit.mutex.unlock();
+        },
     }
 }
 
@@ -279,11 +302,6 @@ fn parseTokens(bytes: []u8, tokens: *[128][]u8) !usize {
         }
     }
 
-    // std.debug.print("\n", .{});
-    // for (0..tokenCount) |i| {
-    //     std.debug.print("Token {}: '{s}'\n", .{ i, tokens[i] });
-    // }
-
     return tokenCount;
 }
 
@@ -317,6 +335,7 @@ test "parseTokens" {
     const msg = "hello\r\nworld\r\n";
     @memcpy(bytes[0..msg.len], msg);
     _ = try parseTokens(&bytes, &tokens);
+
     try std.testing.expectEqualStrings(tokens[0], "hello");
     try std.testing.expectEqualStrings(tokens[1], "world");
 }
@@ -326,4 +345,22 @@ test "ConcurrentHash" {
     var hash = std.StringHashMap([]const u8).init(std.testing.allocator);
     defer hash.deinit();
     try hash.put(str, str);
+}
+
+test "split_commands" {
+    const msg = "*1\r\n$9\r\nPING\nPING\r\n";
+    var buffer: [64]u8 = undefined;
+    @memcpy(buffer[0..msg.len], msg);
+
+    var commands: [32]?[]u8 = undefined;
+    for (0..commands.len) |i| {
+        commands[i] = null;
+    }
+
+    _ = try splitCommands(&buffer, &commands);
+
+    try std.testing.expectEqualSlices(u8, "*1\r\n$9\r\nPING", commands[0].?);
+    try std.testing.expectEqualSlices(u8, "PING\r\n", commands[1].?[0..6]);
+ 
+    try std.testing.expect(commands[2] == null);
 }
