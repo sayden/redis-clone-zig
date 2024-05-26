@@ -9,23 +9,34 @@ const Commands = enum {
     SET_EXPIRY,
     GET,
     QUIT,
+    CONFIG_SET,
+    CONFIG_GET,
 };
+
+const Quit = struct {
+    mutex: Mutex = Mutex{},
+    quit: bool = false,
+};
+
+const Errors = error{InvalidCharacter};
 
 const CommandEnd = "\n";
 const TokenSplit = "\r\n";
-const Errors = error{InvalidCharacter};
 var quit = Quit{};
 
 const KvArray = struct {
     hashmap: std.StringHashMap([]u8),
+    config: std.StringHashMap([]u8),
     expiries: std.StringHashMap(i64),
     alloc: std.mem.Allocator,
     mutex: Mutex = Mutex{},
+    cfgMutex: Mutex = Mutex{},
     const Errors = error{NotFound};
 
     pub fn init(alloc: std.mem.Allocator) KvArray {
         return KvArray{
             .hashmap = std.StringHashMap([]u8).init(alloc),
+            .config = std.StringHashMap([]u8).init(alloc),
             .expiries = std.StringHashMap(i64).init(alloc),
             .alloc = alloc,
             .mutex = Mutex{},
@@ -54,6 +65,33 @@ const KvArray = struct {
         }
     }
 
+    pub fn configSet(self: *KvArray, key: []u8, value: []u8) !void {
+        const _key = try self.alloc.alloc(u8, key.len);
+        errdefer self.alloc.free(_key);
+
+        const _value = try self.alloc.alloc(u8, value.len);
+        errdefer self.alloc.free(_value);
+
+        @memcpy(_key, key);
+        @memcpy(_value, value);
+
+        self.cfgMutex.lock();
+        defer self.cfgMutex.unlock();
+
+        try self.config.put(_key, _value);
+    }
+
+    pub fn configGet(self: *KvArray, key: []u8) ![]u8 {
+        self.cfgMutex.lock();
+        defer self.cfgMutex.unlock();
+
+        const value = self.config.get(key) orelse {
+            return KvArray.Errors.NotFound;
+        };
+
+        return value;
+    }
+
     pub fn get(self: *KvArray, key: []u8) ![]u8 {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -61,80 +99,21 @@ const KvArray = struct {
         const value = self.hashmap.get(key) orelse {
             return KvArray.Errors.NotFound;
         };
+        const expiration = self.expiries.get(key) orelse {
+            return value;
+        };
+        const now = std.time.milliTimestamp();
+        if (expiration <= now) {
+            _ = self.hashmap.remove(key);
+            _ = self.expiries.remove(key);
+            return KvArray.Errors.NotFound;
+        }
 
         return value;
     }
 };
 
-pub fn expiryThread(kvs: *KvArray) !void {
-    defer std.debug.print("'Expiry checks' thread finished\n", .{});
-
-    while (true) {
-        std.time.sleep(100000000);
-
-        quit.mutex.lock();
-        if (quit.quit) {
-            quit.mutex.unlock();
-            return;
-        }
-        quit.mutex.unlock();
-
-        var iter = kvs.expiries.iterator();
-
-        kvs.mutex.lock();
-        while (iter.next()) |entry| {
-            const now = std.time.milliTimestamp();
-            if (entry.value_ptr.* <= now) {
-                _ = kvs.hashmap.remove(entry.key_ptr.*);
-                _ = kvs.expiries.remove(entry.key_ptr.*);
-            }
-        }
-        kvs.mutex.unlock();
-    }
-}
-
-pub fn main() !void {
-    std.debug.print("Logs from your program will appear here!\n", .{});
-
-    const address = try net.Address.resolveIp("127.0.0.1", 6379);
-
-    var listener = try address.listen(.{
-        .reuse_address = true,
-        .force_nonblocking = true,
-    });
-    defer listener.deinit();
-
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer chechMemoryLeak(&gpa);
-    var arena = std.heap.ArenaAllocator.init(gpa.allocator());
-    const alloc = arena.allocator();
-    defer arena.deinit();
-
-    var kvs = KvArray.init(alloc);
-    defer kvs.deinit();
-
-    var thread = try std.Thread.spawn(.{}, expiryThread, .{&kvs});
-    defer thread.join();
-
-    while (true) {
-        quit.mutex.lock();
-        if (quit.quit) {
-            std.debug.print("Shutting down\n", .{});
-            quit.mutex.unlock();
-            break;
-        }
-        quit.mutex.unlock();
-
-        if (listener.accept()) |connection| {
-            var t = try std.Thread.spawn(.{}, handle, .{ connection, &kvs });
-            t.detach();
-        } else |_| {
-            std.time.sleep(1000000);
-        }
-    }
-}
-
-fn chechMemoryLeak(gpa: *std.heap.GeneralPurposeAllocator(.{})) void {
+fn checkMemoryLeak(gpa: *std.heap.GeneralPurposeAllocator(.{})) void {
     const res = gpa.deinit();
     switch (res) {
         std.heap.Check.ok => {},
@@ -142,12 +121,7 @@ fn chechMemoryLeak(gpa: *std.heap.GeneralPurposeAllocator(.{})) void {
     }
 }
 
-const Quit = struct {
-    mutex: Mutex = Mutex{},
-    quit: bool = false,
-};
-
-fn handle(connection: net.Server.Connection, kvs: *KvArray) !void {
+fn handleConnection(connection: net.Server.Connection, kvs: *KvArray) !void {
     const conReader = connection.stream.reader();
 
     var tokens: [128][]u8 = undefined;
@@ -159,11 +133,11 @@ fn handle(connection: net.Server.Connection, kvs: *KvArray) !void {
     while (true) {
         var buffer: [1024]u8 = undefined;
         if (try conReader.read(&buffer) > 0) {
-            try splitCommands(&buffer, &commands);
+            try splitLines(&buffer, &commands);
             for (commands) |command| {
                 if (command) |cmd| {
-                    const n = try parseTokens(cmd, &tokens);
-                    try handleCommand(&tokens, n, connection, kvs);
+                    const n = try bytesToTokens(cmd, &tokens);
+                    try executeCommand(&tokens, n, connection, kvs);
                 } else {
                     break;
                 }
@@ -172,28 +146,15 @@ fn handle(connection: net.Server.Connection, kvs: *KvArray) !void {
     }
 }
 
-fn splitCommands(buf: []u8, commands: *[32]?[]u8) !void {
-    var left: usize = 0;
-    var items: usize = 0;
-
-    for (buf, 0..) |c, i| {
-        if (c == '\n' and i != 0 and buf[i - 1] != '\r') {
-            commands[items] = buf[left..i];
-            items += 1;
-            left = i + 1;
-        }
-    }
-
-    commands[items] = buf[left..];
-}
-
-fn handleCommand(tokens: *[128][]u8, n: usize, connection: net.Server.Connection, kvs: *KvArray) !void {
-    switch (getCommands(tokens, n)) {
+fn executeCommand(tokens: *[128][]u8, n: usize, connection: net.Server.Connection, kvs: *KvArray) !void {
+    switch (tokensToCommands(tokens, n)) {
         Commands.PING => try connection.stream.writeAll("+PONG\r\n"),
         Commands.ECHO => try echoCommand(tokens, n, connection),
         Commands.SET => try setCommand(tokens, n, connection, kvs),
         Commands.GET => try getCommand(tokens, n, connection, kvs),
         Commands.SET_EXPIRY => try setCommand(tokens, n, connection, kvs),
+        Commands.CONFIG_GET => try configGetCommand(tokens, n, connection, kvs),
+        Commands.CONFIG_SET => try configSetCommand(tokens, n, connection, kvs),
         Commands.QUIT => {
             quit.mutex.lock();
             quit.quit = true;
@@ -201,6 +162,34 @@ fn handleCommand(tokens: *[128][]u8, n: usize, connection: net.Server.Connection
             quit.mutex.unlock();
         },
     }
+}
+
+fn configSetCommand(tokens: *[128][]u8, n: usize, connection: net.Server.Connection, kvs: *KvArray) !void {
+    if (n < 9) {
+        std.debug.print("Unexpected number of arguments {}\n", .{n});
+        return error.InvalidNumberArguments;
+    }
+
+    try kvs.configSet(tokens[4], tokens[6]);
+
+    // kvs.iter += 1;
+    try std.fmt.format(connection.stream.writer(), "+OK\r\n", .{});
+}
+
+fn configGetCommand(tokens: *[128][]u8, n: usize, connection: net.Server.Connection, kvs: *KvArray) !void {
+    if (n != 7) {
+        std.debug.print("Unexpected number of arguments {}\n", .{n});
+        return error.Invalid;
+    }
+
+    const val = kvs.configGet(tokens[6]) catch {
+        try std.fmt.format(connection.stream.writer(), "$-1\r\n", .{});
+        return;
+    };
+
+    try std.fmt.format(connection.stream.writer(), "*2\r\n${d}\r\n{s}\r\n${d}\r\n{s}\r\n", .{ tokens[6].len, tokens[6], val.len, val });
+
+    return;
 }
 
 fn getCommand(tokens: *[128][]u8, n: usize, connection: net.Server.Connection, kvs: *KvArray) !void {
@@ -247,14 +236,6 @@ fn setCommand(tokens: *[128][]u8, n: usize, connection: net.Server.Connection, k
     try std.fmt.format(connection.stream.writer(), "+OK\r\n", .{});
 }
 
-fn toUpper(s: []u8) void {
-    for (s, 0..) |c, i| {
-        if (c >= 'a' and c <= 'z') {
-            s[i] -= 32;
-        }
-    }
-}
-
 fn echoCommand(tokens: *[128][]u8, n: usize, connection: net.Server.Connection) !void {
     if (n != 5) {
         return error.Invalid;
@@ -263,7 +244,7 @@ fn echoCommand(tokens: *[128][]u8, n: usize, connection: net.Server.Connection) 
     try std.fmt.format(connection.stream.writer(), "${d}\r\n{s}\r\n", .{ tokens[4].len, tokens[4] });
 }
 
-fn getCommands(tokens: *[128][]u8, _: usize) Commands {
+fn tokensToCommands(tokens: *[128][]u8, _: usize) Commands {
     toUpper(tokens[2]);
 
     if (str_eq(tokens[2], "PING")) {
@@ -281,12 +262,20 @@ fn getCommands(tokens: *[128][]u8, _: usize) Commands {
         return Commands.GET;
     } else if (str_eq(tokens[2], "QUIT")) {
         return Commands.QUIT;
+    } else if (str_eq(tokens[2], "CONFIG")) {
+        toUpper(tokens[4]);
+        if (str_eq(tokens[4], "SET")) {
+            return Commands.CONFIG_SET;
+        } else if (str_eq(tokens[4], "GET")) {
+            return Commands.CONFIG_GET;
+        }
+        return Commands.PING;
     }
 
     return Commands.PING;
 }
 
-fn parseTokens(bytes: []u8, tokens: *[128][]u8) !usize {
+fn bytesToTokens(bytes: []u8, tokens: *[128][]u8) !usize {
     var left: usize = 0;
     var tokenCount: usize = 0;
 
@@ -314,6 +303,29 @@ fn parseTokens(bytes: []u8, tokens: *[128][]u8) !usize {
     return tokenCount;
 }
 
+fn splitLines(buf: []u8, commands: *[32]?[]u8) !void {
+    var left: usize = 0;
+    var items: usize = 0;
+
+    for (buf, 0..) |c, i| {
+        if (c == '\n' and i != 0 and buf[i - 1] != '\r') {
+            commands[items] = buf[left..i];
+            items += 1;
+            left = i + 1;
+        }
+    }
+
+    commands[items] = buf[left..];
+}
+
+fn toUpper(s: []u8) void {
+    for (s, 0..) |c, i| {
+        if (c >= 'a' and c <= 'z') {
+            s[i] -= 32;
+        }
+    }
+}
+
 fn str_eq(a: []u8, b: []const u8) bool {
     if (a.len != b.len) {
         return false;
@@ -326,6 +338,63 @@ fn str_eq(a: []u8, b: []const u8) bool {
     }
 
     return true;
+}
+
+pub fn main() !void {
+    std.debug.print("Logs from your program will appear here!\n", .{});
+
+    const address = try net.Address.resolveIp("127.0.0.1", 6379);
+
+    var listener = try address.listen(.{
+        .reuse_address = true,
+        .force_nonblocking = true,
+    });
+    defer listener.deinit();
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer checkMemoryLeak(&gpa);
+    var arena = std.heap.ArenaAllocator.init(gpa.allocator());
+    const alloc = arena.allocator();
+    defer arena.deinit();
+
+    var argsIterator = try std.process.ArgIterator.initWithAllocator(alloc);
+    defer argsIterator.deinit();
+
+    var kvs = KvArray.init(alloc);
+    defer kvs.deinit();
+
+    while (argsIterator.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--dir")) {
+            const val = argsIterator.next() orelse {
+                std.debug.print("Missing argument for --dir\n", .{});
+                return error.MissingArgument;
+            };
+            try kvs.configSet(@constCast("dir"), @constCast(val));
+        } else if (std.mem.eql(u8, arg, "--dbfilename")) {
+            const val = argsIterator.next() orelse {
+                std.debug.print("Missing argument for --dir\n", .{});
+                return error.MissingArgument;
+            };
+            try kvs.configSet(@constCast("dbfilename"), @constCast(val));
+        }
+    }
+
+    while (true) {
+        quit.mutex.lock();
+        if (quit.quit) {
+            std.debug.print("Shutting down\n", .{});
+            quit.mutex.unlock();
+            break;
+        }
+        quit.mutex.unlock();
+
+        if (listener.accept()) |connection| {
+            var t = try std.Thread.spawn(.{}, handleConnection, .{ connection, &kvs });
+            t.detach();
+        } else |_| {
+            std.time.sleep(1000000);
+        }
+    }
 }
 
 test "toUpper" {
@@ -343,7 +412,7 @@ test "parseTokens" {
     var bytes: [64]u8 = undefined;
     const msg = "hello\r\nworld\r\n";
     @memcpy(bytes[0..msg.len], msg);
-    _ = try parseTokens(bytes[0..msg.len], &tokens);
+    _ = try bytesToTokens(bytes[0..msg.len], &tokens);
 
     try std.testing.expectEqualStrings(tokens[0], "hello");
     try std.testing.expectEqualStrings(tokens[1], "world");
@@ -352,7 +421,7 @@ test "parseTokens" {
     @memcpy(bytes[0..msg2.len], msg2);
 
     var tokens2: [128][]u8 = undefined;
-    const n = parseTokens(bytes[0..msg2.len], &tokens2);
+    const n = bytesToTokens(bytes[0..msg2.len], &tokens2);
     try std.testing.expectEqual(n, 5);
 }
 
@@ -373,7 +442,7 @@ test "split_commands" {
         commands[i] = null;
     }
 
-    _ = try splitCommands(&buffer, &commands);
+    _ = try splitLines(&buffer, &commands);
 
     try std.testing.expectEqualSlices(u8, "*1\r\n$9\r\nPING", commands[0].?);
     try std.testing.expectEqualSlices(u8, "PING\r\n", commands[1].?[0..6]);
@@ -385,7 +454,147 @@ test "split_commands" {
     for (0..commands.len) |i| {
         commands[i] = null;
     }
-    _ = try splitCommands(buffer[0..msg2.len], &commands);
+    _ = try splitLines(buffer[0..msg2.len], &commands);
     try std.testing.expectEqualSlices(u8, msg2, commands[0].?);
     try std.testing.expect(commands[1] == null);
+}
+
+test "parseRdbFile" {
+    const dump = try std.fs.cwd().openFile("dump.rdb", .{ .mode = .read_only });
+    defer dump.close();
+
+    const stat = try dump.stat();
+
+    const header = try std.posix.mmap(null, stat.size, std.posix.PROT.READ, std.posix.MAP{ .TYPE = .SHARED }, dump.handle, 0);
+    // allocate enough for the header only
+
+    const magic = header[0..5];
+    std.debug.print("\nHeader: '{s}'\n", .{magic});
+    const version = header[5..9];
+    std.debug.print("Version Number: '{s}'\n", .{version});
+
+    std.debug.print("Auxiliary {X}: ", .{header[9]});
+    var pivot = try readAuxiliaryBlock(header[10..]);
+    pivot += 10;
+
+    std.debug.print("Auxiliary {X}: ", .{header[pivot]});
+    pivot += 1;
+    pivot += try readAuxiliaryBlock(header[pivot..]);
+
+    std.debug.print("Auxiliary {X}: ", .{header[pivot]});
+    pivot += 1;
+    pivot += try readAuxiliaryBlock(header[pivot..]);
+
+    std.debug.print("Auxiliary {X}: ", .{header[pivot]});
+    pivot += 1;
+    pivot += try readAuxiliaryBlock(header[pivot..]);
+
+    std.debug.print("Auxiliary {X}: ", .{header[pivot]});
+    pivot += 1;
+    pivot += try readAuxiliaryBlock(header[pivot..]);
+
+    // std.debug.print("Database selector: {X}\n", .{header[pivot]});
+    // pivot += 1;
+    // std.debug.print("Db number {d}\n", .{header[pivot]});
+    // pivot += 1;
+    // std.debug.print("ResizeDb field {d}\n", .{header[pivot]});
+
+    // const a = [_]u8{ le, header[bitPos + 1] };
+    // _ = try std.fmt.parseInt(u16, &a, 10);
+    // std.debug.print("Bit: '{} {}\n", .{ le, header[bitPos + 1] });
+    // std.debug.print("{d}\n", .{std.fmt.parseInt(i16,&{le,header[bitPos+1]}) });
+}
+
+fn readAuxiliaryBlock(buf: []u8) !usize {
+    var key1: []u8 = undefined;
+    var n = try stringEncoding(buf, &key1);
+    std.debug.print("{s} -> ", .{key1});
+    var pivot: usize = n;
+
+    var value1: []u8 = undefined;
+    n = try stringEncoding(buf[pivot..], &value1);
+    pivot += n;
+    std.debug.print("'{s}'\n", .{value1});
+
+    return pivot;
+}
+
+const Length = enum {
+    Next6BitsAreLength,
+    AddByteForLength,
+    Next4BytesAreLength,
+    Special,
+    Unknown,
+};
+
+fn stringEncoding(buf: []u8, str: *[]u8) !usize {
+    const firstTwo = buf[0] & 0b11000000;
+    const length = redisLengthEncoding(firstTwo);
+    return switch (length) {
+        Length.Next6BitsAreLength => {
+            const n = buf[0];
+            str.* = buf[1 .. 1 + n];
+            return n + 1;
+        },
+        Length.AddByteForLength => {
+            std.debug.print("One byte more is length {d}\n", .{buf[0..2]});
+            const n = try std.fmt.parseInt(u8, buf[0..2], 10);
+            std.debug.print("{}\n", .{n});
+            str.* = buf[2 .. 2 + n];
+            return n + 3;
+        },
+        Length.Next4BytesAreLength => {
+            std.debug.print("Next 4 bytes are length\n", .{});
+            str.* = buf[4..8];
+            return 6;
+        },
+        Length.Special => {
+            const last6 = buf[0] & 0b00111111;
+            switch (last6) {
+                0 => {
+                    var tmp: [8]u8 = undefined;
+                    const res = try std.fmt.bufPrint(&tmp, "{d}", .{buf[1]});
+                    str.* = res;
+                    return 2;
+                },
+                1 => {
+                    std.debug.print("1\n", .{});
+                    const n: u8 = buf[1];
+                    var tmp: [8]u8 = undefined;
+                    const res = try std.fmt.bufPrint(&tmp, "{d}", .{n});
+                    str.* = res[0..2];
+                    return 2;
+                },
+                2 => {
+                    const n = std.mem.readInt(u32, buf[1..5], .big);
+                    var tmp: [32]u8 = undefined;
+                    const res = try std.fmt.bufPrint(&tmp, "{d}", .{n});
+                    str.* = res;
+                    return 5;
+                },
+                3 => {
+                    const n = try std.fmt.parseInt(u8, buf[1..9], 10);
+                    str.* = buf[9 .. 9 + n];
+                    return n + 9;
+                },
+                else => return error.UnexpectedSpecial,
+            }
+            return 0;
+        },
+        Length.Unknown => {
+            std.debug.print("Unknown\n", .{});
+            return 0;
+        },
+    };
+}
+
+fn redisLengthEncoding(byte: u8) Length {
+    const firstTwo = byte & 0b11000000;
+    return switch (firstTwo) {
+        0b00000000 => Length.Next6BitsAreLength,
+        0b01000000 => Length.AddByteForLength,
+        0b10000000 => Length.Next4BytesAreLength,
+        0b11000000 => Length.Special,
+        else => Length.Unknown,
+    };
 }
