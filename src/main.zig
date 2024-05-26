@@ -150,7 +150,6 @@ const Quit = struct {
 fn handle(connection: net.Server.Connection, kvs: *KvArray) !void {
     const conReader = connection.stream.reader();
 
-    var buffer: [1024]u8 = undefined;
     var tokens: [128][]u8 = undefined;
     var commands: [32]?[]u8 = undefined;
     for (0..commands.len) |i| {
@@ -158,6 +157,7 @@ fn handle(connection: net.Server.Connection, kvs: *KvArray) !void {
     }
 
     while (true) {
+        var buffer: [1024]u8 = undefined;
         if (try conReader.read(&buffer) > 0) {
             try splitCommands(&buffer, &commands);
             for (commands) |command| {
@@ -221,13 +221,14 @@ fn getCommand(tokens: *[128][]u8, n: usize, connection: net.Server.Connection, k
 
 // *2\r\n$4\r\nECHO\r\n$3\r\nhey\r\n
 // *2\r\n$3\r\nGET\r\n$9\r\nraspberry\r\n
-// *2 $3 GET $9 foo
+// *2 $3 GET $3 foo
 // *2 $3 SET $3 foo $3 bar
 // *2 $3 SET $3 foo $3 bar $2 PX $3 100
 //
 //  0  1   2  3   4  5   6  7  8  9  10
 fn setCommand(tokens: *[128][]u8, n: usize, connection: net.Server.Connection, kvs: *KvArray) !void {
     if (n < 7) {
+        std.debug.print("Unexpected number of arguments {}\n", .{n});
         return error.InvalidNumberArguments;
     }
 
@@ -289,6 +290,8 @@ fn parseTokens(bytes: []u8, tokens: *[128][]u8) !usize {
     var left: usize = 0;
     var tokenCount: usize = 0;
 
+    // std.debug.print("Parsing: '{s}'\n", .{bytes});
+
     for (bytes, 0..) |c, i| {
         switch (c) {
             '\r' => {
@@ -303,6 +306,10 @@ fn parseTokens(bytes: []u8, tokens: *[128][]u8) !usize {
             else => {},
         }
     }
+
+    // for (0..tokenCount) |i| {
+    //     std.debug.print("Found: '{s}'\n", .{tokens[i]});
+    // }
 
     return tokenCount;
 }
@@ -333,13 +340,20 @@ test "toUpper" {
 
 test "parseTokens" {
     var tokens: [128][]u8 = undefined;
-    var bytes: [32]u8 = undefined;
+    var bytes: [64]u8 = undefined;
     const msg = "hello\r\nworld\r\n";
     @memcpy(bytes[0..msg.len], msg);
-    _ = try parseTokens(&bytes, &tokens);
+    _ = try parseTokens(bytes[0..msg.len], &tokens);
 
     try std.testing.expectEqualStrings(tokens[0], "hello");
     try std.testing.expectEqualStrings(tokens[1], "world");
+
+    const msg2 = "*2\r\n$3\r\nGET\r\n$5\r\ngrape\r\n";
+    @memcpy(bytes[0..msg2.len], msg2);
+
+    var tokens2: [128][]u8 = undefined;
+    const n = parseTokens(bytes[0..msg2.len], &tokens2);
+    try std.testing.expectEqual(n, 5);
 }
 
 test "ConcurrentHash" {
@@ -365,4 +379,13 @@ test "split_commands" {
     try std.testing.expectEqualSlices(u8, "PING\r\n", commands[1].?[0..6]);
 
     try std.testing.expect(commands[2] == null);
+
+    const msg2 = "*3\r\n$3\r\nSET\r\n$9\r\nraspberry\r\n$5\r\nmango\r\n";
+    @memcpy(buffer[0..msg2.len], msg2);
+    for (0..commands.len) |i| {
+        commands[i] = null;
+    }
+    _ = try splitCommands(buffer[0..msg2.len], &commands);
+    try std.testing.expectEqualSlices(u8, msg2, commands[0].?);
+    try std.testing.expect(commands[1] == null);
 }
