@@ -13,6 +13,8 @@ const Commands = enum {
 
 const CommandEnd = "\n";
 const TokenSplit = "\r\n";
+const Errors = error{InvalidCharacter};
+var quit = Quit{};
 
 const KvArray = struct {
     hashmap: std.StringHashMap([]u8),
@@ -145,9 +147,6 @@ const Quit = struct {
     quit: bool = false,
 };
 
-const Errors = error{InvalidCharacter};
-var quit = Quit{};
-
 fn handle(connection: net.Server.Connection, kvs: *KvArray) !void {
     const conReader = connection.stream.reader();
 
@@ -206,6 +205,7 @@ fn handleCommand(tokens: *[128][]u8, n: usize, connection: net.Server.Connection
 
 fn getCommand(tokens: *[128][]u8, n: usize, connection: net.Server.Connection, kvs: *KvArray) !void {
     if (n != 5) {
+        std.debug.print("Unexpected number of arguments {}\n", .{n});
         return error.Invalid;
     }
 
@@ -220,6 +220,8 @@ fn getCommand(tokens: *[128][]u8, n: usize, connection: net.Server.Connection, k
 }
 
 // *2\r\n$4\r\nECHO\r\n$3\r\nhey\r\n
+// *2\r\n$3\r\nGET\r\n$9\r\nraspberry\r\n
+// *2 $3 GET $9 foo
 // *2 $3 SET $3 foo $3 bar
 // *2 $3 SET $3 foo $3 bar $2 PX $3 100
 //
@@ -361,6 +363,6 @@ test "split_commands" {
 
     try std.testing.expectEqualSlices(u8, "*1\r\n$9\r\nPING", commands[0].?);
     try std.testing.expectEqualSlices(u8, "PING\r\n", commands[1].?[0..6]);
- 
+
     try std.testing.expect(commands[2] == null);
 }
