@@ -70,7 +70,7 @@ pub fn expiryThread(kvs: *KvArray) !void {
     defer std.debug.print("'Expiry checks' thread finished\n", .{});
 
     while (true) {
-        std.time.sleep(1000000000);
+        std.time.sleep(100000000);
 
         quit.mutex.lock();
         if (quit.quit) {
