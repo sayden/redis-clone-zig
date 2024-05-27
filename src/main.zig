@@ -1,6 +1,8 @@
 const std = @import("std");
 const net = std.net;
 const Mutex = std.Thread.Mutex;
+const testing = std.testing;
+const fmt = std.fmt;
 
 const Commands = enum {
     PING,
@@ -47,17 +49,19 @@ const KvArray = struct {
         self.hashmap.deinit();
     }
 
+    // *2\r\n$4\r\nECHO\r\n$3\r\nhey\r\n
     pub fn keys(self: *KvArray, c: net.Server.Connection) !void {
+        const writer = c.stream.writer();
+
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        const writer = c.stream.writer();
         const size = self.hashmap.count();
-        try std.fmt.format(writer, "*{d}\r\n", .{size});
+        try fmt.format(writer, "*{d}\r\n", .{@as(u32, size)});
 
         var iter = self.hashmap.keyIterator();
         while (iter.next()) |key| {
-            try std.fmt.format(writer, "${d}\r\n{s}\r\n", .{ key.len, key });
+            try fmt.format(writer, "${d}\r\n{s}\r\n", .{ key.*.len, key.* });
         }
     }
 
@@ -174,15 +178,13 @@ fn executeCommand(tokens: *[128][]u8, n: usize, connection: net.Server.Connectio
         Commands.QUIT => {
             quit.mutex.lock();
             quit.quit = true;
-            connection.stream.close();
             quit.mutex.unlock();
         },
     }
 }
 
-fn keysCommand(connection: net.Server.Connection, kvs: *KvArray) !void {
-    try kvs.keys(connection);
-    connection.stream.close();
+fn keysCommand(c: net.Server.Connection, kvs: *KvArray) !void {
+    try kvs.keys(c);
 }
 
 fn configSetCommand(tokens: *[128][]u8, n: usize, connection: net.Server.Connection, kvs: *KvArray) !void {
@@ -194,8 +196,7 @@ fn configSetCommand(tokens: *[128][]u8, n: usize, connection: net.Server.Connect
     try kvs.configSet(tokens[4], tokens[6]);
 
     // kvs.iter += 1;
-    try std.fmt.format(connection.stream.writer(), "+OK\r\n", .{});
-    connection.stream.close();
+    try fmt.format(connection.stream.writer(), "+OK\r\n", .{});
 }
 
 fn configGetCommand(tokens: *[128][]u8, n: usize, connection: net.Server.Connection, kvs: *KvArray) !void {
@@ -205,17 +206,23 @@ fn configGetCommand(tokens: *[128][]u8, n: usize, connection: net.Server.Connect
     }
 
     const val = kvs.configGet(tokens[6]) catch {
-        try std.fmt.format(connection.stream.writer(), "$-1\r\n", .{});
+        try fmt.format(connection.stream.writer(), "$-1\r\n", .{});
         return;
     };
 
-    try std.fmt.format(connection.stream.writer(), "*2\r\n${d}\r\n{s}\r\n${d}\r\n{s}\r\n", .{ tokens[6].len, tokens[6], val.len, val });
-
-    connection.stream.close();
+    try fmt.format(connection.stream.writer(), "*2\r\n${d}\r\n{s}\r\n${d}\r\n{s}\r\n", .{
+        tokens[6].len,
+        tokens[6],
+        val.len,
+        val,
+    });
 
     return;
 }
 
+// *2\r\n$3\r\nGET\r\n$6\r\nbanana\r\n
+// *2 $3 GET $6 banana
+//  0  1   2  3      4
 fn getCommand(tokens: *[128][]u8, n: usize, connection: net.Server.Connection, kvs: *KvArray) !void {
     if (n != 5) {
         std.debug.print("Unexpected number of arguments {}\n", .{n});
@@ -223,13 +230,11 @@ fn getCommand(tokens: *[128][]u8, n: usize, connection: net.Server.Connection, k
     }
 
     const val = kvs.get(tokens[4]) catch {
-        try std.fmt.format(connection.stream.writer(), "$-1\r\n", .{});
+        try fmt.format(connection.stream.writer(), "$-1\r\n", .{});
         return;
     };
 
-    try std.fmt.format(connection.stream.writer(), "${d}\r\n{s}\r\n", .{ val.len, val });
-
-    connection.stream.close();
+    try fmt.format(connection.stream.writer(), "${d}\r\n{s}\r\n", .{ val.len, val });
 
     return;
 }
@@ -251,7 +256,7 @@ fn setCommand(tokens: *[128][]u8, n: usize, connection: net.Server.Connection, k
         toUpper(tokens[8]);
         if (str_eq(tokens[8], "PX")) {
             const now = std.time.milliTimestamp();
-            const expiry = try std.fmt.parseInt(i64, tokens[10], 10);
+            const expiry = try fmt.parseInt(i64, tokens[10], 10);
             try kvs.put(tokens[4], tokens[6], expiry + now);
         }
     } else {
@@ -259,7 +264,7 @@ fn setCommand(tokens: *[128][]u8, n: usize, connection: net.Server.Connection, k
     }
 
     // kvs.iter += 1;
-    try std.fmt.format(connection.stream.writer(), "+OK\r\n", .{});
+    try fmt.format(connection.stream.writer(), "+OK\r\n", .{});
 }
 
 fn echoCommand(tokens: *[128][]u8, n: usize, connection: net.Server.Connection) !void {
@@ -267,7 +272,7 @@ fn echoCommand(tokens: *[128][]u8, n: usize, connection: net.Server.Connection) 
         return error.Invalid;
     }
 
-    try std.fmt.format(connection.stream.writer(), "${d}\r\n{s}\r\n", .{ tokens[4].len, tokens[4] });
+    try fmt.format(connection.stream.writer(), "${d}\r\n{s}\r\n", .{ tokens[4].len, tokens[4] });
 }
 
 fn tokensToCommands(tokens: *[128][]u8, _: usize) Commands {
@@ -403,10 +408,10 @@ pub fn main() !void {
                 std.debug.print("Missing argument for --dir\n", .{});
                 return error.MissingArgument;
             };
-            try loadDBFile(val, &kvs);
             try kvs.configSet(@constCast("dbfilename"), @constCast(val));
         }
     }
+    try loadDBFile(&kvs);
 
     while (true) {
         quit.mutex.lock();
@@ -460,29 +465,93 @@ const LengthEncoding = struct {
     }
 };
 
-fn loadDBFile(filename: []const u8, kvs: *KvArray) !void {
-    const file = try std.fs.cwd().openFile(filename, .{ .mode = .read_only });
+fn readHeader(db: []align(std.mem.page_size) u8, kvs: *KvArray) !void {
+    const magic = db[0..5];
+
+    std.debug.print("\ndb: '{s}'\n", .{magic});
+    const version = db[5..9];
+    std.debug.print("Version Number: '{s}'\n", .{version});
+
+    var pivot: usize = 9;
+    var block: RDBType = undefined;
+
+    while (true) {
+        if (pivot >= db.len) {
+            break;
+        }
+        block = getRDBBlockType(db[pivot]);
+        pivot += 1;
+        switch (block) {
+            RDBType.Auxiliary => {
+                pivot += try printAuxiliary(db[pivot..]);
+            },
+            RDBType.DatabaseSelector => {
+                std.debug.print("Database Selector: {X} \n", .{db[pivot]}); // Database number
+                pivot += 1;
+            },
+            RDBType.ResizeDB => {
+                pivot += try printResizeDB(db[pivot..]);
+                pivot += try loadKvsFromDb(db, pivot, kvs);
+            },
+            RDBType.EOF => {
+                std.debug.print("EOF, ", .{}); // Database number
+                std.debug.print("CRC64: {X}. \n", .{db[pivot .. pivot + 8]});
+                pivot += 8;
+                break;
+            },
+            else => {},
+        }
+    }
+}
+
+fn loadKvsFromDb(db: []align(std.mem.page_size) u8, starting_pivot: usize, kvs: *KvArray) !usize {
+    var pivot: usize = starting_pivot;
+    var key: LengthEncoding = undefined;
+    var value: LengthEncoding = undefined;
+    var valueType: ValueType = ValueType.Unknown;
+
+    while (true) {
+        valueType = getValueType(db[pivot]);
+        pivot += 1;
+        if (valueType == ValueType.Unknown) {
+            break;
+        }
+
+        key = try getEncodedString(db[pivot..]); // 1-ula, 2-mario
+        pivot += key.accLen();
+
+        value = try getEncodedString(db[pivot..]); // 1-korn, 2-caster
+        pivot += value.accLen();
+        try kvs.put(key.str[0..key.str.len], value.str[0..value.str.len], null);
+    }
+
+    return pivot;
+}
+
+fn loadDBFile(kvs: *KvArray) !void {
+    const dir = kvs.configGet(@constCast("dir")) catch {
+        return;
+    };
+    const dbfilename = kvs.configGet(@constCast("dbfilename")) catch {
+        return;
+    };
+
+    var buf: [std.fs.MAX_PATH_BYTES]u8 = undefined;
+    const filepath = try fmt.bufPrint(&buf, "{s}/{s}", .{ dir, dbfilename });
+
+    std.debug.print("Loading file: '{s}'\n", .{filepath});
+
+    const file = std.fs.openFileAbsolute(filepath, .{ .mode = .read_only }) catch {
+        std.debug.print("File not found: '{s}'\n", .{filepath});
+        return;
+    };
     defer file.close();
     const stat = try file.stat();
 
     const db = try std.posix.mmap(null, stat.size, std.posix.PROT.READ, std.posix.MAP{ .TYPE = .SHARED }, file.handle, 0);
     defer std.posix.munmap(db);
 
-    var pivot: usize = 0;
-    while (true) {
-        const key = try getEncodedString(db[pivot..]); // 1-ula, 2-mario
-        pivot += key.accLen();
-
-        const val = try getEncodedString(db[pivot..]); // 1-korn, 2-caster
-        pivot += val.accLen();
-
-        try kvs.put(key.str, val.str, null);
-
-        if (db[pivot] != 0x00) {
-            break;
-        }
-        pivot += 1;
-    }
+    try readHeader(db, kvs);
 }
 
 fn getEncodedString(buf: []u8) !LengthEncoding {
@@ -543,18 +612,18 @@ fn getLength(buf: []u8) !LengthData {
         },
         Length.Special8BitInt => {
             // Integer as a string: 8-bit
-            const n = try std.fmt.parseInt(u8, buf[1..2], 10);
+            const n = try fmt.parseInt(u8, buf[1..2], 10);
             return LengthData{ .length = @as(usize, n), .skip = 1 };
         },
         Length.Special16BitInt => {
             // Integer as a string: 16-bit
             const nn: [8]u8 = .{ 0, 0, 0, 0, buf[1], buf[2], 0, 0 };
-            return LengthData{ .length = try std.fmt.parseInt(usize, &nn, 10), .skip = 3 };
+            return LengthData{ .length = try fmt.parseInt(usize, &nn, 10), .skip = 3 };
         },
         Length.Special32BitInt => {
             // Integer as a string: 32-bit
             const nn: [8]u8 = .{ 0, 0, 0, 0, buf[1], buf[2], buf[3], buf[4] };
-            return LengthData{ .length = try std.fmt.parseInt(usize, &nn, 10), .skip = 5 };
+            return LengthData{ .length = try fmt.parseInt(usize, &nn, 10), .skip = 5 };
         },
         Length.SpecialCompressed => {
             return error.CompressedStringNotImplemented;
@@ -619,11 +688,47 @@ fn printAuxiliary(header: []u8) !usize {
 
     return pivot;
 }
+const ValueType = enum {
+    String,
+    List,
+    Set,
+    SortedSet,
+    Hash,
+    ZipMap,
+    ZipList,
+    IntSet,
+    SortedSetZipList,
+    HashZipList,
+    Unknown,
+};
+
+fn getValueType(b: u8) ValueType {
+    switch (b) {
+        0x00 => return ValueType.String,
+        0x01 => return ValueType.List,
+        0x02 => return ValueType.Set,
+        0x03 => return ValueType.SortedSet,
+        0x04 => return ValueType.Hash,
+        0x09 => return ValueType.ZipMap,
+        0x0A => return ValueType.ZipList,
+        0x0B => return ValueType.IntSet,
+        0x0C => return ValueType.SortedSetZipList,
+        0x0D => return ValueType.HashZipList,
+        else => return ValueType.Unknown,
+    }
+}
 
 fn printKvs(buf: []u8) !usize {
     var pivot: usize = 0;
     var lenEnc: LengthEncoding = undefined;
+    var valueType: ValueType = ValueType.Unknown;
     while (true) {
+        valueType = getValueType(buf[pivot]);
+        pivot += 1;
+        if (valueType == ValueType.Unknown) {
+            break;
+        }
+
         lenEnc = try getEncodedString(buf[pivot..]); // 1-ula, 2-mario
         pivot += lenEnc.accLen();
         std.debug.print("'{s}', ", .{lenEnc.str});
@@ -631,11 +736,6 @@ fn printKvs(buf: []u8) !usize {
         lenEnc = try getEncodedString(buf[pivot..]); // 1-korn, 2-caster
         pivot += lenEnc.accLen();
         std.debug.print("'{s}'\n", .{lenEnc.str});
-
-        if (buf[pivot] != 0x00) {
-            break;
-        }
-        pivot += 1;
     }
     return pivot;
 }
@@ -646,30 +746,23 @@ fn printResizeDB(header: []u8) !usize {
     var pivot: usize = 0;
     var lengthData = try getLength(header); // Database hash table size
     std.debug.print("\n\tHash Table size: {d}", .{lengthData.length});
-    // FIXME:
     pivot += lengthData.skip;
 
     lengthData = try getLength(header[pivot..]); // Database hash table size
     std.debug.print("\n\tExpiry Hash table size: {d}\n", .{lengthData.length});
-    // FIXME:
     pivot += lengthData.skip;
 
-    if (header[pivot] == 0x00) {
-        pivot += 1;
-        return pivot;
-    }
-
-    return error.UnexpectedByteInResizeDB;
+    return pivot;
 }
 
 test "toUpper" {
-    var alloc = std.testing.allocator;
+    var alloc = testing.allocator;
     const ar = try alloc.alloc(u8, 5);
     defer alloc.free(ar);
 
     @memcpy(ar, "hello");
     toUpper(ar);
-    try std.testing.expectEqualStrings(ar, "HELLO");
+    try testing.expectEqualStrings(ar, "HELLO");
 }
 
 test "parseTokens" {
@@ -679,20 +772,24 @@ test "parseTokens" {
     @memcpy(bytes[0..msg.len], msg);
     _ = try bytesToTokens(bytes[0..msg.len], &tokens);
 
-    try std.testing.expectEqualStrings(tokens[0], "hello");
-    try std.testing.expectEqualStrings(tokens[1], "world");
+    try testing.expectEqualStrings(tokens[0], "hello");
+    try testing.expectEqualStrings(tokens[1], "world");
 
     const msg2 = "*2\r\n$3\r\nGET\r\n$5\r\ngrape\r\n";
     @memcpy(bytes[0..msg2.len], msg2);
 
     var tokens2: [128][]u8 = undefined;
-    const n = bytesToTokens(bytes[0..msg2.len], &tokens2);
-    try std.testing.expectEqual(n, 5);
+    var n = bytesToTokens(bytes[0..msg2.len], &tokens2);
+    try testing.expectEqual(n, 5);
+
+    const msg3 = "*2\r\n$3\r\nGET\r\n$6\r\nbanana\r\n";
+    n = bytesToTokens(@constCast(msg3), &tokens2);
+    try testing.expectEqual(5, n);
 }
 
 test "ConcurrentHash" {
     const str = "hello";
-    var hash = std.StringHashMap([]const u8).init(std.testing.allocator);
+    var hash = std.StringHashMap([]const u8).init(testing.allocator);
     defer hash.deinit();
     try hash.put(str, str);
 }
@@ -709,10 +806,10 @@ test "split_commands" {
 
     _ = try splitLines(&buffer, &commands);
 
-    try std.testing.expectEqualSlices(u8, "*1\r\n$9\r\nPING", commands[0].?);
-    try std.testing.expectEqualSlices(u8, "PING\r\n", commands[1].?[0..6]);
+    try testing.expectEqualSlices(u8, "*1\r\n$9\r\nPING", commands[0].?);
+    try testing.expectEqualSlices(u8, "PING\r\n", commands[1].?[0..6]);
 
-    try std.testing.expect(commands[2] == null);
+    try testing.expect(commands[2] == null);
 
     const msg2 = "*3\r\n$3\r\nSET\r\n$9\r\nraspberry\r\n$5\r\nmango\r\n";
     @memcpy(buffer[0..msg2.len], msg2);
@@ -720,8 +817,8 @@ test "split_commands" {
         commands[i] = null;
     }
     _ = try splitLines(buffer[0..msg2.len], &commands);
-    try std.testing.expectEqualSlices(u8, msg2, commands[0].?);
-    try std.testing.expect(commands[1] == null);
+    try testing.expectEqualSlices(u8, msg2, commands[0].?);
+    try testing.expect(commands[1] == null);
 }
 
 test "getLengthEncoding" {
@@ -729,65 +826,19 @@ test "getLengthEncoding" {
     @memcpy(&hello, "hello");
     hello[0] = 0b00000100;
     var n = try getEncodedString(&hello);
-    try std.testing.expectEqual(4, n.str.len);
-    try std.testing.expectEqual(1, n.skip);
-    try std.testing.expectEqualStrings("ello", n.str);
+    try testing.expectEqual(4, n.str.len);
+    try testing.expectEqual(1, n.skip);
+    try testing.expectEqualStrings("ello", n.str);
     hello[0] = 0b01000000;
     hello[1] = 0b00000001;
     n = try getEncodedString(&hello);
-    try std.testing.expectEqual(1, n.str.len);
-    try std.testing.expectEqual(2, n.skip);
-    try std.testing.expectEqualStrings("l", n.str);
+    try testing.expectEqual(1, n.str.len);
+    try testing.expectEqual(2, n.skip);
+    try testing.expectEqualStrings("l", n.str);
     hello[0] = 0b11000000;
     hello[1] = 64;
     n = try getEncodedString(&hello);
-    try std.testing.expectEqual(1, n.str.len);
-    try std.testing.expectEqual(1, n.skip);
-    try std.testing.expectEqual(@as(u8, 64), n.str[1 - n.str.len]);
-}
-
-test "parseRdbFilev1" {
-    const dump = try std.fs.cwd().openFile("dump.rdb", .{ .mode = .read_only });
-    defer dump.close();
-
-    const stat = try dump.stat();
-
-    const header = try std.posix.mmap(null, stat.size, std.posix.PROT.READ, std.posix.MAP{ .TYPE = .SHARED }, dump.handle, 0);
-    defer std.posix.munmap(header);
-
-    const magic = header[0..5];
-    std.debug.print("\nHeader: '{s}'\n", .{magic});
-    const version = header[5..9];
-    std.debug.print("Version Number: '{s}'\n", .{version});
-
-    var pivot: usize = 9;
-    var block: RDBType = undefined;
-
-    while (true) {
-        if (pivot >= header.len) {
-            break;
-        }
-        block = getRDBBlockType(header[pivot]);
-        pivot += 1;
-        switch (block) {
-            RDBType.Auxiliary => {
-                pivot += try printAuxiliary(header[pivot..]);
-            },
-            RDBType.DatabaseSelector => {
-                std.debug.print("Database Selector: {X} \n", .{header[pivot]}); // Database number
-                pivot += 1;
-            },
-            RDBType.ResizeDB => {
-                pivot += try printResizeDB(header[pivot..]);
-                pivot += try printKvs(header[pivot..]);
-            },
-            RDBType.EOF => {
-                std.debug.print("EOF, ", .{}); // Database number
-                std.debug.print("CRC64: {X}. \n", .{header[pivot .. pivot + 8]});
-                pivot += 8;
-                break;
-            },
-            else => {},
-        }
-    }
+    try testing.expectEqual(1, n.str.len);
+    try testing.expectEqual(1, n.skip);
+    try testing.expectEqual(@as(u8, 64), n.str[1 - n.str.len]);
 }
