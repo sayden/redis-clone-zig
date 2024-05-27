@@ -11,6 +11,7 @@ const Commands = enum {
     QUIT,
     CONFIG_SET,
     CONFIG_GET,
+    KEYS,
 };
 
 const Quit = struct {
@@ -44,6 +45,20 @@ const KvArray = struct {
     }
     pub fn deinit(self: *KvArray) void {
         self.hashmap.deinit();
+    }
+
+    pub fn keys(self: *KvArray, c: net.Server.Connection) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const writer = c.stream.writer();
+        const size = self.hashmap.count();
+        try std.fmt.format(writer, "*{d}\r\n", .{size});
+
+        var iter = self.hashmap.keyIterator();
+        while (iter.next()) |key| {
+            try std.fmt.format(writer, "${d}\r\n{s}\r\n", .{ key.len, key });
+        }
     }
 
     pub fn put(self: *KvArray, key: []u8, value: []u8, expiry: ?i64) !void {
@@ -155,6 +170,7 @@ fn executeCommand(tokens: *[128][]u8, n: usize, connection: net.Server.Connectio
         Commands.SET_EXPIRY => try setCommand(tokens, n, connection, kvs),
         Commands.CONFIG_GET => try configGetCommand(tokens, n, connection, kvs),
         Commands.CONFIG_SET => try configSetCommand(tokens, n, connection, kvs),
+        Commands.KEYS => try keysCommand(connection, kvs),
         Commands.QUIT => {
             quit.mutex.lock();
             quit.quit = true;
@@ -162,6 +178,11 @@ fn executeCommand(tokens: *[128][]u8, n: usize, connection: net.Server.Connectio
             quit.mutex.unlock();
         },
     }
+}
+
+fn keysCommand(connection: net.Server.Connection, kvs: *KvArray) !void {
+    try kvs.keys(connection);
+    connection.stream.close();
 }
 
 fn configSetCommand(tokens: *[128][]u8, n: usize, connection: net.Server.Connection, kvs: *KvArray) !void {
@@ -174,6 +195,7 @@ fn configSetCommand(tokens: *[128][]u8, n: usize, connection: net.Server.Connect
 
     // kvs.iter += 1;
     try std.fmt.format(connection.stream.writer(), "+OK\r\n", .{});
+    connection.stream.close();
 }
 
 fn configGetCommand(tokens: *[128][]u8, n: usize, connection: net.Server.Connection, kvs: *KvArray) !void {
@@ -188,6 +210,8 @@ fn configGetCommand(tokens: *[128][]u8, n: usize, connection: net.Server.Connect
     };
 
     try std.fmt.format(connection.stream.writer(), "*2\r\n${d}\r\n{s}\r\n${d}\r\n{s}\r\n", .{ tokens[6].len, tokens[6], val.len, val });
+
+    connection.stream.close();
 
     return;
 }
@@ -204,6 +228,8 @@ fn getCommand(tokens: *[128][]u8, n: usize, connection: net.Server.Connection, k
     };
 
     try std.fmt.format(connection.stream.writer(), "${d}\r\n{s}\r\n", .{ val.len, val });
+
+    connection.stream.close();
 
     return;
 }
@@ -262,6 +288,8 @@ fn tokensToCommands(tokens: *[128][]u8, _: usize) Commands {
         return Commands.GET;
     } else if (str_eq(tokens[2], "QUIT")) {
         return Commands.QUIT;
+    } else if (str_eq(tokens[2], "KEYS")) {
+        return Commands.KEYS;
     } else if (str_eq(tokens[2], "CONFIG")) {
         toUpper(tokens[4]);
         if (str_eq(tokens[4], "SET")) {
@@ -375,6 +403,7 @@ pub fn main() !void {
                 std.debug.print("Missing argument for --dir\n", .{});
                 return error.MissingArgument;
             };
+            try loadDBFile(val, &kvs);
             try kvs.configSet(@constCast("dbfilename"), @constCast(val));
         }
     }
@@ -395,6 +424,242 @@ pub fn main() !void {
             std.time.sleep(1000000);
         }
     }
+}
+
+const Length = enum {
+    Next6BitsAreLength,
+    AddByteForLength,
+    Next4BytesAreLength,
+    Special8BitInt,
+    Special16BitInt,
+    Special32BitInt,
+    SpecialCompressed,
+    Unknown,
+};
+
+const EncodingType = enum {
+    Bits8,
+    Bits16,
+    Bits32,
+    String,
+    CompressedString,
+};
+
+const LengthEncoding = struct {
+    // How many bytes to skip
+    skip: u8,
+
+    str: []u8,
+
+    // To signal if str is an integer as a string, for example
+    encType: EncodingType,
+    lengthType: Length,
+
+    pub fn accLen(self: @This()) usize {
+        return self.str.len + self.skip;
+    }
+};
+
+fn loadDBFile(filename: []const u8, kvs: *KvArray) !void {
+    const file = try std.fs.cwd().openFile(filename, .{ .mode = .read_only });
+    defer file.close();
+    const stat = try file.stat();
+
+    const db = try std.posix.mmap(null, stat.size, std.posix.PROT.READ, std.posix.MAP{ .TYPE = .SHARED }, file.handle, 0);
+    defer std.posix.munmap(db);
+
+    var pivot: usize = 0;
+    while (true) {
+        const key = try getEncodedString(db[pivot..]); // 1-ula, 2-mario
+        pivot += key.accLen();
+
+        const val = try getEncodedString(db[pivot..]); // 1-korn, 2-caster
+        pivot += val.accLen();
+
+        try kvs.put(key.str, val.str, null);
+
+        if (db[pivot] != 0x00) {
+            break;
+        }
+        pivot += 1;
+    }
+}
+
+fn getEncodedString(buf: []u8) !LengthEncoding {
+    const length = getLengthFromByte(buf[0]);
+
+    return switch (length) {
+        Length.Next6BitsAreLength => {
+            const n: usize = buf[0] & 0b00111111;
+            return LengthEncoding{ .skip = 1, .str = buf[1 .. 1 + n], .encType = EncodingType.String, .lengthType = length };
+        },
+        Length.AddByteForLength => {
+            const n: u8 = buf[0] & 0b00111111;
+            const nn: [8]u8 = .{ 0, 0, 0, 0, 0, 0, n, buf[1] };
+            const size = std.mem.readInt(usize, &nn, .big);
+            return LengthEncoding{ .skip = 2, .str = buf[2 .. 2 + size], .encType = EncodingType.String, .lengthType = length };
+        },
+        Length.Next4BytesAreLength => {
+            const nn: [8]u8 = .{ 0, 0, 0, 0, buf[1], buf[2], buf[3], buf[4] };
+            const size = std.mem.readInt(usize, &nn, .big);
+            return LengthEncoding{ .skip = 5, .str = buf[5 .. 5 + size], .encType = EncodingType.String, .lengthType = length };
+        },
+        Length.Special8BitInt => {
+            return LengthEncoding{ .skip = 1, .str = buf[1..2], .encType = EncodingType.Bits8, .lengthType = length };
+        },
+        Length.Special16BitInt => {
+            return LengthEncoding{ .skip = 1, .str = buf[1..3], .encType = EncodingType.Bits16, .lengthType = length };
+        },
+        Length.Special32BitInt => {
+            return LengthEncoding{ .skip = 1, .str = buf[1..5], .encType = EncodingType.Bits32, .lengthType = length };
+        },
+        Length.SpecialCompressed => {
+            // TODO: compressed string
+            return error.CompressedStringNotImplemented;
+        },
+        else => return error.UnknownLengthEncoding,
+    };
+}
+
+const LengthData = struct {
+    length: usize,
+    skip: usize,
+};
+
+fn getLength(buf: []u8) !LengthData {
+    const length = getLengthFromByte(buf[0]);
+    return switch (length) {
+        Length.Next6BitsAreLength => {
+            return LengthData{ .length = @as(usize, buf[0] & 0b00111111), .skip = 1 };
+        },
+        Length.AddByteForLength => {
+            const n: u8 = buf[0] & 0b00111111;
+            const nn: [8]u8 = .{ 0, 0, 0, 0, 0, 0, n, buf[1] };
+            return LengthData{ .length = std.mem.readInt(usize, &nn, .big), .skip = 2 };
+        },
+        Length.Next4BytesAreLength => {
+            const nn: [8]u8 = .{ 0, 0, 0, 0, buf[1], buf[2], buf[3], buf[4] };
+            return LengthData{ .length = std.mem.readInt(usize, &nn, .big), .skip = 5 };
+        },
+        Length.Special8BitInt => {
+            // Integer as a string: 8-bit
+            const n = try std.fmt.parseInt(u8, buf[1..2], 10);
+            return LengthData{ .length = @as(usize, n), .skip = 1 };
+        },
+        Length.Special16BitInt => {
+            // Integer as a string: 16-bit
+            const nn: [8]u8 = .{ 0, 0, 0, 0, buf[1], buf[2], 0, 0 };
+            return LengthData{ .length = try std.fmt.parseInt(usize, &nn, 10), .skip = 3 };
+        },
+        Length.Special32BitInt => {
+            // Integer as a string: 32-bit
+            const nn: [8]u8 = .{ 0, 0, 0, 0, buf[1], buf[2], buf[3], buf[4] };
+            return LengthData{ .length = try std.fmt.parseInt(usize, &nn, 10), .skip = 5 };
+        },
+        Length.SpecialCompressed => {
+            return error.CompressedStringNotImplemented;
+        },
+        else => return error.UnknownLengthEncoding,
+    };
+}
+
+fn getLengthFromByte(byte: u8) Length {
+    const firstTwo = byte & 0b11000000;
+    return switch (firstTwo) {
+        0b00000000 => Length.Next6BitsAreLength,
+        0b01000000 => Length.AddByteForLength,
+        0b10000000 => Length.Next4BytesAreLength,
+        0b11000000 => {
+            return switch (byte) {
+                0b11000000 => Length.Special8BitInt,
+                0b11000001 => Length.Special16BitInt,
+                0b11000010 => Length.Special32BitInt,
+                0b11000011 => Length.SpecialCompressed,
+                else => Length.Unknown,
+            };
+        },
+        else => Length.Unknown,
+    };
+}
+
+const RDBType = enum {
+    Auxiliary,
+    DatabaseSelector,
+    EOF,
+    ExpireTimeMs,
+    ExpireTimeSeconds,
+    ResizeDB,
+    Unknown,
+};
+
+fn getRDBBlockType(b: u8) RDBType {
+    return switch (b) {
+        0xFA => RDBType.Auxiliary,
+        0xFE => RDBType.DatabaseSelector,
+        0xFF => RDBType.EOF,
+        0xFC => RDBType.ExpireTimeMs,
+        0xFD => RDBType.ExpireTimeSeconds,
+        0xFB => RDBType.ResizeDB,
+        else => RDBType.Unknown,
+    };
+}
+
+fn printAuxiliary(header: []u8) !usize {
+    var pivot: usize = 0;
+
+    std.debug.print("FA: ", .{});
+
+    var lenEnc = try getEncodedString(header[pivot..]);
+    std.debug.print("{s} -> ", .{lenEnc.str});
+    pivot += lenEnc.accLen();
+
+    lenEnc = try getEncodedString(header[pivot..]);
+    std.debug.print("'{s}'\n", .{lenEnc.str});
+    pivot += lenEnc.accLen();
+
+    return pivot;
+}
+
+fn printKvs(buf: []u8) !usize {
+    var pivot: usize = 0;
+    var lenEnc: LengthEncoding = undefined;
+    while (true) {
+        lenEnc = try getEncodedString(buf[pivot..]); // 1-ula, 2-mario
+        pivot += lenEnc.accLen();
+        std.debug.print("'{s}', ", .{lenEnc.str});
+
+        lenEnc = try getEncodedString(buf[pivot..]); // 1-korn, 2-caster
+        pivot += lenEnc.accLen();
+        std.debug.print("'{s}'\n", .{lenEnc.str});
+
+        if (buf[pivot] != 0x00) {
+            break;
+        }
+        pivot += 1;
+    }
+    return pivot;
+}
+
+fn printResizeDB(header: []u8) !usize {
+    std.debug.print("ResizeDB: ", .{}); // Database number
+
+    var pivot: usize = 0;
+    var lengthData = try getLength(header); // Database hash table size
+    std.debug.print("\n\tHash Table size: {d}", .{lengthData.length});
+    // FIXME:
+    pivot += lengthData.skip;
+
+    lengthData = try getLength(header[pivot..]); // Database hash table size
+    std.debug.print("\n\tExpiry Hash table size: {d}\n", .{lengthData.length});
+    // FIXME:
+    pivot += lengthData.skip;
+
+    if (header[pivot] == 0x00) {
+        pivot += 1;
+        return pivot;
+    }
+
+    return error.UnexpectedByteInResizeDB;
 }
 
 test "toUpper" {
@@ -459,142 +724,70 @@ test "split_commands" {
     try std.testing.expect(commands[1] == null);
 }
 
-test "parseRdbFile" {
+test "getLengthEncoding" {
+    var hello: [5]u8 = undefined;
+    @memcpy(&hello, "hello");
+    hello[0] = 0b00000100;
+    var n = try getEncodedString(&hello);
+    try std.testing.expectEqual(4, n.str.len);
+    try std.testing.expectEqual(1, n.skip);
+    try std.testing.expectEqualStrings("ello", n.str);
+    hello[0] = 0b01000000;
+    hello[1] = 0b00000001;
+    n = try getEncodedString(&hello);
+    try std.testing.expectEqual(1, n.str.len);
+    try std.testing.expectEqual(2, n.skip);
+    try std.testing.expectEqualStrings("l", n.str);
+    hello[0] = 0b11000000;
+    hello[1] = 64;
+    n = try getEncodedString(&hello);
+    try std.testing.expectEqual(1, n.str.len);
+    try std.testing.expectEqual(1, n.skip);
+    try std.testing.expectEqual(@as(u8, 64), n.str[1 - n.str.len]);
+}
+
+test "parseRdbFilev1" {
     const dump = try std.fs.cwd().openFile("dump.rdb", .{ .mode = .read_only });
     defer dump.close();
 
     const stat = try dump.stat();
 
     const header = try std.posix.mmap(null, stat.size, std.posix.PROT.READ, std.posix.MAP{ .TYPE = .SHARED }, dump.handle, 0);
-    // allocate enough for the header only
+    defer std.posix.munmap(header);
 
     const magic = header[0..5];
     std.debug.print("\nHeader: '{s}'\n", .{magic});
     const version = header[5..9];
     std.debug.print("Version Number: '{s}'\n", .{version});
 
-    std.debug.print("Auxiliary {X}: ", .{header[9]});
-    var pivot = try readAuxiliaryBlock(header[10..]);
-    pivot += 10;
+    var pivot: usize = 9;
+    var block: RDBType = undefined;
 
-    std.debug.print("Auxiliary {X}: ", .{header[pivot]});
-    pivot += 1;
-    pivot += try readAuxiliaryBlock(header[pivot..]);
-
-    std.debug.print("Auxiliary {X}: ", .{header[pivot]});
-    pivot += 1;
-    pivot += try readAuxiliaryBlock(header[pivot..]);
-
-    std.debug.print("Auxiliary {X}: ", .{header[pivot]});
-    pivot += 1;
-    pivot += try readAuxiliaryBlock(header[pivot..]);
-
-    std.debug.print("Auxiliary {X}: ", .{header[pivot]});
-    pivot += 1;
-    pivot += try readAuxiliaryBlock(header[pivot..]);
-
-    // std.debug.print("Database selector: {X}\n", .{header[pivot]});
-    // pivot += 1;
-    // std.debug.print("Db number {d}\n", .{header[pivot]});
-    // pivot += 1;
-    // std.debug.print("ResizeDb field {d}\n", .{header[pivot]});
-
-    // const a = [_]u8{ le, header[bitPos + 1] };
-    // _ = try std.fmt.parseInt(u16, &a, 10);
-    // std.debug.print("Bit: '{} {}\n", .{ le, header[bitPos + 1] });
-    // std.debug.print("{d}\n", .{std.fmt.parseInt(i16,&{le,header[bitPos+1]}) });
-}
-
-fn readAuxiliaryBlock(buf: []u8) !usize {
-    var key1: []u8 = undefined;
-    var n = try stringEncoding(buf, &key1);
-    std.debug.print("{s} -> ", .{key1});
-    var pivot: usize = n;
-
-    var value1: []u8 = undefined;
-    n = try stringEncoding(buf[pivot..], &value1);
-    pivot += n;
-    std.debug.print("'{s}'\n", .{value1});
-
-    return pivot;
-}
-
-const Length = enum {
-    Next6BitsAreLength,
-    AddByteForLength,
-    Next4BytesAreLength,
-    Special,
-    Unknown,
-};
-
-fn stringEncoding(buf: []u8, str: *[]u8) !usize {
-    const firstTwo = buf[0] & 0b11000000;
-    const length = redisLengthEncoding(firstTwo);
-    return switch (length) {
-        Length.Next6BitsAreLength => {
-            const n = buf[0];
-            str.* = buf[1 .. 1 + n];
-            return n + 1;
-        },
-        Length.AddByteForLength => {
-            std.debug.print("One byte more is length {d}\n", .{buf[0..2]});
-            const n = try std.fmt.parseInt(u8, buf[0..2], 10);
-            std.debug.print("{}\n", .{n});
-            str.* = buf[2 .. 2 + n];
-            return n + 3;
-        },
-        Length.Next4BytesAreLength => {
-            std.debug.print("Next 4 bytes are length\n", .{});
-            str.* = buf[4..8];
-            return 6;
-        },
-        Length.Special => {
-            const last6 = buf[0] & 0b00111111;
-            switch (last6) {
-                0 => {
-                    var tmp: [8]u8 = undefined;
-                    const res = try std.fmt.bufPrint(&tmp, "{d}", .{buf[1]});
-                    str.* = res;
-                    return 2;
-                },
-                1 => {
-                    std.debug.print("1\n", .{});
-                    const n: u8 = buf[1];
-                    var tmp: [8]u8 = undefined;
-                    const res = try std.fmt.bufPrint(&tmp, "{d}", .{n});
-                    str.* = res[0..2];
-                    return 2;
-                },
-                2 => {
-                    const n = std.mem.readInt(u32, buf[1..5], .big);
-                    var tmp: [32]u8 = undefined;
-                    const res = try std.fmt.bufPrint(&tmp, "{d}", .{n});
-                    str.* = res;
-                    return 5;
-                },
-                3 => {
-                    const n = try std.fmt.parseInt(u8, buf[1..9], 10);
-                    str.* = buf[9 .. 9 + n];
-                    return n + 9;
-                },
-                else => return error.UnexpectedSpecial,
-            }
-            return 0;
-        },
-        Length.Unknown => {
-            std.debug.print("Unknown\n", .{});
-            return 0;
-        },
-    };
-}
-
-fn redisLengthEncoding(byte: u8) Length {
-    const firstTwo = byte & 0b11000000;
-    return switch (firstTwo) {
-        0b00000000 => Length.Next6BitsAreLength,
-        0b01000000 => Length.AddByteForLength,
-        0b10000000 => Length.Next4BytesAreLength,
-        0b11000000 => Length.Special,
-        else => Length.Unknown,
-    };
+    while (true) {
+        if (pivot >= header.len) {
+            break;
+        }
+        block = getRDBBlockType(header[pivot]);
+        pivot += 1;
+        switch (block) {
+            RDBType.Auxiliary => {
+                pivot += try printAuxiliary(header[pivot..]);
+            },
+            RDBType.DatabaseSelector => {
+                std.debug.print("Database Selector: {X} \n", .{header[pivot]}); // Database number
+                pivot += 1;
+            },
+            RDBType.ResizeDB => {
+                pivot += try printResizeDB(header[pivot..]);
+                pivot += try printKvs(header[pivot..]);
+            },
+            RDBType.EOF => {
+                std.debug.print("EOF, ", .{}); // Database number
+                std.debug.print("CRC64: {X}. \n", .{header[pivot .. pivot + 8]});
+                pivot += 8;
+                break;
+            },
+            else => {},
+        }
+    }
 }
