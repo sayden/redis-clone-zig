@@ -31,9 +31,12 @@ const KvArray = struct {
     hashmap: std.StringHashMap([]u8),
     config: std.StringHashMap([]u8),
     expiries: std.StringHashMap(i64),
+
     alloc: std.mem.Allocator,
+
     mutex: Mutex = Mutex{},
     cfgMutex: Mutex = Mutex{},
+
     const Errors = error{NotFound};
 
     pub fn init(alloc: std.mem.Allocator) KvArray {
@@ -100,32 +103,33 @@ const KvArray = struct {
         try self.config.put(_key, _value);
     }
 
-    pub fn configGet(self: *KvArray, key: []u8) ![]u8 {
+    pub fn configGet(self: *KvArray, key: []u8) ?[]u8 {
         self.cfgMutex.lock();
         defer self.cfgMutex.unlock();
 
         const value = self.config.get(key) orelse {
-            return KvArray.Errors.NotFound;
+            return null;
         };
 
         return value;
     }
 
-    pub fn get(self: *KvArray, key: []u8) ![]u8 {
+    pub fn get(self: *KvArray, key: []u8) ?[]u8 {
         self.mutex.lock();
         defer self.mutex.unlock();
 
         const value = self.hashmap.get(key) orelse {
-            return KvArray.Errors.NotFound;
+            return null;
         };
         const expiration = self.expiries.get(key) orelse {
             return value;
         };
         const now = std.time.milliTimestamp();
         if (expiration <= now) {
+            std.debug.print("Key expired: {s}\n", .{key});
             _ = self.hashmap.remove(key);
             _ = self.expiries.remove(key);
-            return KvArray.Errors.NotFound;
+            return null;
         }
 
         return value;
@@ -205,17 +209,18 @@ fn configGetCommand(tokens: *[128][]u8, n: usize, connection: net.Server.Connect
         return error.Invalid;
     }
 
-    const val = kvs.configGet(tokens[6]) catch {
-        try fmt.format(connection.stream.writer(), "$-1\r\n", .{});
-        return;
-    };
+    if (kvs.configGet(tokens[6])) |val| {
+        try fmt.format(connection.stream.writer(), "*2\r\n${d}\r\n{s}\r\n${d}\r\n{s}\r\n", .{
+            tokens[6].len,
+            tokens[6],
+            val.len,
+            val,
+        });
 
-    try fmt.format(connection.stream.writer(), "*2\r\n${d}\r\n{s}\r\n${d}\r\n{s}\r\n", .{
-        tokens[6].len,
-        tokens[6],
-        val.len,
-        val,
-    });
+        return;
+    }
+
+    try fmt.format(connection.stream.writer(), "$-1\r\n", .{});
 
     return;
 }
@@ -229,12 +234,12 @@ fn getCommand(tokens: *[128][]u8, n: usize, connection: net.Server.Connection, k
         return error.Invalid;
     }
 
-    const val = kvs.get(tokens[4]) catch {
-        try fmt.format(connection.stream.writer(), "$-1\r\n", .{});
+    if (kvs.get(tokens[4])) |val| {
+        try fmt.format(connection.stream.writer(), "${d}\r\n{s}\r\n", .{ val.len, val });
         return;
-    };
+    }
 
-    try fmt.format(connection.stream.writer(), "${d}\r\n{s}\r\n", .{ val.len, val });
+    try fmt.format(connection.stream.writer(), "$-1\r\n", .{});
 
     return;
 }
@@ -257,6 +262,7 @@ fn setCommand(tokens: *[128][]u8, n: usize, connection: net.Server.Connection, k
         if (str_eq(tokens[8], "PX")) {
             const now = std.time.milliTimestamp();
             const expiry = try fmt.parseInt(i64, tokens[10], 10);
+            std.debug.print("Setting expiration (now: {d}, or: {d}): {d}\n", .{ expiry + now, expiry, now });
             try kvs.put(tokens[4], tokens[6], expiry + now);
         }
     } else {
@@ -374,8 +380,6 @@ fn str_eq(a: []u8, b: []const u8) bool {
 }
 
 pub fn main() !void {
-    std.debug.print("Logs from your program will appear here!\n", .{});
-
     const address = try net.Address.resolveIp("127.0.0.1", 6379);
 
     var listener = try address.listen(.{
@@ -411,7 +415,12 @@ pub fn main() !void {
             try kvs.configSet(@constCast("dbfilename"), @constCast(val));
         }
     }
-    try loadDBFile(&kvs);
+
+    const dir = kvs.configGet(@constCast("dir"));
+    const dbfilename = kvs.configGet(@constCast("dbfilename"));
+
+    try loadDBFile(&kvs, dir, dbfilename);
+    std.debug.print("Finished loaded db\n", .{});
 
     while (true) {
         quit.mutex.lock();
@@ -450,22 +459,7 @@ const EncodingType = enum {
     CompressedString,
 };
 
-const LengthEncoding = struct {
-    // How many bytes to skip
-    skip: u8,
-
-    str: []u8,
-
-    // To signal if str is an integer as a string, for example
-    encType: EncodingType,
-    lengthType: Length,
-
-    pub fn accLen(self: @This()) usize {
-        return self.str.len + self.skip;
-    }
-};
-
-fn readHeader(db: []align(std.mem.page_size) u8, kvs: *KvArray) !void {
+fn readDB(db: []align(std.mem.page_size) u8, kvs: *KvArray) !void {
     const magic = db[0..5];
 
     std.debug.print("\ndb: '{s}'\n", .{magic});
@@ -479,8 +473,10 @@ fn readHeader(db: []align(std.mem.page_size) u8, kvs: *KvArray) !void {
         if (pivot >= db.len) {
             break;
         }
+
         block = getRDBBlockType(db[pivot]);
         pivot += 1;
+
         switch (block) {
             RDBType.Auxiliary => {
                 pivot += try printAuxiliary(db[pivot..]);
@@ -491,139 +487,208 @@ fn readHeader(db: []align(std.mem.page_size) u8, kvs: *KvArray) !void {
             },
             RDBType.ResizeDB => {
                 pivot += try printResizeDB(db[pivot..]);
-                pivot += try loadKvsFromDb(db, pivot, kvs);
             },
             RDBType.EOF => {
-                std.debug.print("EOF, ", .{}); // Database number
-                std.debug.print("CRC64: {X}. \n", .{db[pivot .. pivot + 8]});
+                std.debug.print("CRC64: {d} \n", .{std.mem.readVarInt(u64, db[pivot .. pivot + 8], .little)});
                 pivot += 8;
-                break;
+                return;
             },
-            else => {},
+            RDBType.ValueType => {
+                // A value type block requires to interpret again the previous byte to get the actual value type
+                // that's why we need to back the pivot by 1 in the next line
+                pivot += try loadKv(db[pivot - 1 ..], kvs, null);
+                pivot -= 1; // we need to back the byte we substracted above too
+            },
+            RDBType.ExpireTimeMs => {
+                const n = std.mem.readVarInt(i64, db[pivot .. pivot + 8], .little);
+                pivot += 8;
+                pivot += try loadKv(db[pivot..], kvs, n);
+            },
+            RDBType.ExpireTimeSeconds => {
+                const n = std.mem.readVarInt(u32, db[pivot .. pivot + 4], .little);
+                pivot += 4;
+                pivot += try loadKv(db[pivot..], kvs, @as(i64, n));
+            },
+            else => {
+                std.debug.print("Unknown block type: {}\n", .{block});
+            },
         }
     }
 }
 
-fn loadKvsFromDb(db: []align(std.mem.page_size) u8, starting_pivot: usize, kvs: *KvArray) !usize {
-    var pivot: usize = starting_pivot;
-    var key: LengthEncoding = undefined;
-    var value: LengthEncoding = undefined;
-    var valueType: ValueType = ValueType.Unknown;
+fn printAuxiliary(db: []u8) !usize {
+    var pivot: usize = 0;
 
-    while (true) {
-        valueType = getValueType(db[pivot]);
-        pivot += 1;
-        if (valueType == ValueType.Unknown) {
-            break;
-        }
+    var length = getLengthFromByte(db[pivot]);
+    var str = try getEncodedString(db[pivot..], length);
+    pivot += getOffsetValue(length) + str.len;
 
-        key = try getEncodedString(db[pivot..]); // 1-ula, 2-mario
-        pivot += key.accLen();
+    std.debug.print("{s} -> ", .{str});
 
-        value = try getEncodedString(db[pivot..]); // 1-korn, 2-caster
-        pivot += value.accLen();
-        try kvs.put(key.str[0..key.str.len], value.str[0..value.str.len], null);
+    length = getLengthFromByte(db[pivot]);
+    switch (length) {
+        Length.Next6BitsAreLength, Length.AddByteForLength, Length.Next4BytesAreLength => {
+            str = try getEncodedString(db[pivot..], length);
+            pivot += getOffsetValue(length) + str.len;
+            std.debug.print(" {s}\n", .{str});
+        },
+        Length.Special8BitInt, Length.Special16BitInt, Length.Special32BitInt => {
+            const n = try getIntegerEncodedAsString(db[pivot..], length);
+            pivot += getOffsetValue(length);
+            std.debug.print(" {d}\n", .{n});
+        },
+        else => {
+            std.debug.print("Unknown length encoding: {}\n", .{length});
+        },
     }
 
     return pivot;
 }
 
-fn loadDBFile(kvs: *KvArray) !void {
-    const dir = kvs.configGet(@constCast("dir")) catch {
-        return;
-    };
-    const dbfilename = kvs.configGet(@constCast("dbfilename")) catch {
-        return;
-    };
+fn loadKv(db: []u8, kvs: *KvArray, expiry: ?i64) !usize {
+    var pivot: usize = 0;
+    const vt = getValueType(db[pivot]);
+    pivot += 1;
 
-    var buf: [std.fs.MAX_PATH_BYTES]u8 = undefined;
-    const filepath = try fmt.bufPrint(&buf, "{s}/{s}", .{ dir, dbfilename });
+    switch (vt) {
+        ValueType.String => {
+            var length = getLengthFromByte(db[pivot]);
+            const key = try getEncodedString(db[pivot..], length);
+            pivot += getOffsetValue(length) + key.len;
 
-    std.debug.print("Loading file: '{s}'\n", .{filepath});
+            length = getLengthFromByte(db[pivot]);
+            const val = try getEncodedString(db[pivot..], length);
+            pivot += getOffsetValue(length) + val.len;
 
-    const file = std.fs.openFileAbsolute(filepath, .{ .mode = .read_only }) catch {
-        std.debug.print("File not found: '{s}'\n", .{filepath});
-        return;
-    };
-    defer file.close();
-    const stat = try file.stat();
+            if (expiry) |e| {
+                std.debug.print("Key: {s}, Value: {s}, Expiry: {d}\n", .{ key, val, e });
+            } else {
+                std.debug.print("Key: {s}, Value: {s}\n", .{ key, val });
+            }
+            try kvs.put(key, val, expiry);
+        },
+        else => {
+            std.debug.print("Unknown value type: {}\n", .{vt});
+        },
+    }
 
-    const db = try std.posix.mmap(null, stat.size, std.posix.PROT.READ, std.posix.MAP{ .TYPE = .SHARED }, file.handle, 0);
-    defer std.posix.munmap(db);
-
-    try readHeader(db, kvs);
+    return pivot;
 }
 
-fn getEncodedString(buf: []u8) !LengthEncoding {
-    const length = getLengthFromByte(buf[0]);
+fn loadDBFile(kvs: *KvArray, dir: ?[]u8, dbfilename: ?[]u8) !void {
+    if (dbfilename) |filename| {
+        var file: std.fs.File = undefined;
 
+        if (dir) |d| {
+            var buf: [std.fs.MAX_PATH_BYTES]u8 = undefined;
+            const filepath = try fmt.bufPrint(&buf, "{s}/{s}", .{ d, filename });
+
+            std.debug.print("Loading file: '{s}'\n", .{filepath});
+
+            file = std.fs.openFileAbsolute(filepath, .{ .mode = .read_only }) catch {
+                std.debug.print("File not found: '{s}'\n", .{filepath});
+                return;
+            };
+        } else {
+            std.debug.print("Loading file: './{s}'\n", .{filename});
+            file = std.fs.cwd().openFile(filename, .{ .mode = .read_only }) catch {
+                std.debug.print("File not found: '{s}'\n", .{filename});
+                return error.FileNotFound;
+            };
+        }
+
+        defer file.close();
+        const stat = try file.stat();
+
+        const db = try std.posix.mmap(null, stat.size, std.posix.PROT.READ, std.posix.MAP{ .TYPE = .SHARED }, file.handle, 0);
+        defer std.posix.munmap(db);
+
+        try readDB(db, kvs);
+        return;
+    }
+
+    return;
+}
+
+fn getIntegerEncodedAsString(buf: []u8, length: Length) !usize {
+    switch (length) {
+        Length.Special8BitInt => {
+            return @as(usize, buf[1]);
+        },
+        Length.Special16BitInt => {
+            const n = std.mem.readVarInt(u16, buf[1..3], .little);
+            return @as(usize, n);
+        },
+        Length.Special32BitInt => {
+            const n = std.mem.readVarInt(u32, buf[1..5], .little);
+            return @as(usize, n);
+        },
+        else => return error.UnknownIntegerStringEncoding,
+    }
+}
+
+fn getEncodedString(buf: []u8, length: Length) ![]u8 {
     return switch (length) {
         Length.Next6BitsAreLength => {
             const n: usize = buf[0] & 0b00111111;
-            return LengthEncoding{ .skip = 1, .str = buf[1 .. 1 + n], .encType = EncodingType.String, .lengthType = length };
+            return buf[1 .. 1 + n];
         },
         Length.AddByteForLength => {
             const n: u8 = buf[0] & 0b00111111;
             const nn: [8]u8 = .{ 0, 0, 0, 0, 0, 0, n, buf[1] };
             const size = std.mem.readInt(usize, &nn, .big);
-            return LengthEncoding{ .skip = 2, .str = buf[2 .. 2 + size], .encType = EncodingType.String, .lengthType = length };
+            return buf[2 .. 2 + size];
         },
         Length.Next4BytesAreLength => {
             const nn: [8]u8 = .{ 0, 0, 0, 0, buf[1], buf[2], buf[3], buf[4] };
             const size = std.mem.readInt(usize, &nn, .big);
-            return LengthEncoding{ .skip = 5, .str = buf[5 .. 5 + size], .encType = EncodingType.String, .lengthType = length };
+            return buf[5 .. 5 + size];
         },
-        Length.Special8BitInt => {
-            return LengthEncoding{ .skip = 1, .str = buf[1..2], .encType = EncodingType.Bits8, .lengthType = length };
-        },
-        Length.Special16BitInt => {
-            return LengthEncoding{ .skip = 1, .str = buf[1..3], .encType = EncodingType.Bits16, .lengthType = length };
-        },
-        Length.Special32BitInt => {
-            return LengthEncoding{ .skip = 1, .str = buf[1..5], .encType = EncodingType.Bits32, .lengthType = length };
-        },
-        Length.SpecialCompressed => {
-            // TODO: compressed string
-            return error.CompressedStringNotImplemented;
-        },
-        else => return error.UnknownLengthEncoding,
+        else => return error.UnknownStringEncoding,
     };
 }
 
-const LengthData = struct {
-    length: usize,
-    skip: usize,
-};
+fn getOffsetValue(l: Length) usize {
+    return switch (l) {
+        Length.Next6BitsAreLength => 1,
+        Length.AddByteForLength => 2,
+        Length.Next4BytesAreLength => 5,
+        Length.Special8BitInt => 2,
+        Length.Special16BitInt => 3,
+        Length.Special32BitInt => 5,
+        Length.SpecialCompressed => 0,
+        else => 0,
+    };
+}
 
-fn getLength(buf: []u8) !LengthData {
-    const length = getLengthFromByte(buf[0]);
-    return switch (length) {
+fn getLength(buf: []u8, l: Length) !usize {
+    return switch (l) {
         Length.Next6BitsAreLength => {
-            return LengthData{ .length = @as(usize, buf[0] & 0b00111111), .skip = 1 };
+            return @as(usize, buf[0] & 0b00111111);
         },
         Length.AddByteForLength => {
             const n: u8 = buf[0] & 0b00111111;
             const nn: [8]u8 = .{ 0, 0, 0, 0, 0, 0, n, buf[1] };
-            return LengthData{ .length = std.mem.readInt(usize, &nn, .big), .skip = 2 };
+            return std.mem.readInt(usize, &nn, .big);
         },
         Length.Next4BytesAreLength => {
             const nn: [8]u8 = .{ 0, 0, 0, 0, buf[1], buf[2], buf[3], buf[4] };
-            return LengthData{ .length = std.mem.readInt(usize, &nn, .big), .skip = 5 };
+            return std.mem.readInt(usize, &nn, .big);
         },
         Length.Special8BitInt => {
             // Integer as a string: 8-bit
             const n = try fmt.parseInt(u8, buf[1..2], 10);
-            return LengthData{ .length = @as(usize, n), .skip = 1 };
+            return @as(usize, n);
         },
         Length.Special16BitInt => {
             // Integer as a string: 16-bit
             const nn: [8]u8 = .{ 0, 0, 0, 0, buf[1], buf[2], 0, 0 };
-            return LengthData{ .length = try fmt.parseInt(usize, &nn, 10), .skip = 3 };
+            return try fmt.parseInt(usize, &nn, 10);
         },
         Length.Special32BitInt => {
             // Integer as a string: 32-bit
             const nn: [8]u8 = .{ 0, 0, 0, 0, buf[1], buf[2], buf[3], buf[4] };
-            return LengthData{ .length = try fmt.parseInt(usize, &nn, 10), .skip = 5 };
+            return try fmt.parseInt(usize, &nn, 10);
         },
         Length.SpecialCompressed => {
             return error.CompressedStringNotImplemented;
@@ -658,6 +723,7 @@ const RDBType = enum {
     ExpireTimeMs,
     ExpireTimeSeconds,
     ResizeDB,
+    ValueType,
     Unknown,
 };
 
@@ -669,25 +735,11 @@ fn getRDBBlockType(b: u8) RDBType {
         0xFC => RDBType.ExpireTimeMs,
         0xFD => RDBType.ExpireTimeSeconds,
         0xFB => RDBType.ResizeDB,
+        0...14 => RDBType.ValueType,
         else => RDBType.Unknown,
     };
 }
 
-fn printAuxiliary(header: []u8) !usize {
-    var pivot: usize = 0;
-
-    std.debug.print("FA: ", .{});
-
-    var lenEnc = try getEncodedString(header[pivot..]);
-    std.debug.print("{s} -> ", .{lenEnc.str});
-    pivot += lenEnc.accLen();
-
-    lenEnc = try getEncodedString(header[pivot..]);
-    std.debug.print("'{s}'\n", .{lenEnc.str});
-    pivot += lenEnc.accLen();
-
-    return pivot;
-}
 const ValueType = enum {
     String,
     List,
@@ -718,39 +770,19 @@ fn getValueType(b: u8) ValueType {
     }
 }
 
-fn printKvs(buf: []u8) !usize {
-    var pivot: usize = 0;
-    var lenEnc: LengthEncoding = undefined;
-    var valueType: ValueType = ValueType.Unknown;
-    while (true) {
-        valueType = getValueType(buf[pivot]);
-        pivot += 1;
-        if (valueType == ValueType.Unknown) {
-            break;
-        }
-
-        lenEnc = try getEncodedString(buf[pivot..]); // 1-ula, 2-mario
-        pivot += lenEnc.accLen();
-        std.debug.print("'{s}', ", .{lenEnc.str});
-
-        lenEnc = try getEncodedString(buf[pivot..]); // 1-korn, 2-caster
-        pivot += lenEnc.accLen();
-        std.debug.print("'{s}'\n", .{lenEnc.str});
-    }
-    return pivot;
-}
-
 fn printResizeDB(header: []u8) !usize {
     std.debug.print("ResizeDB: ", .{}); // Database number
 
     var pivot: usize = 0;
-    var lengthData = try getLength(header); // Database hash table size
-    std.debug.print("\n\tHash Table size: {d}", .{lengthData.length});
-    pivot += lengthData.skip;
+    var length = getLengthFromByte(header[pivot]);
+    var lengthData = try getLength(header, length); // Database hash table size
+    std.debug.print("\n\tHash Table size: {d}", .{lengthData});
+    pivot += getOffsetValue(length);
 
-    lengthData = try getLength(header[pivot..]); // Database hash table size
-    std.debug.print("\n\tExpiry Hash table size: {d}\n", .{lengthData.length});
-    pivot += lengthData.skip;
+    length = getLengthFromByte(header[pivot]);
+    lengthData = try getLength(header[pivot..], length); // Database hash table size
+    std.debug.print("\n\tExpiry Hash table size: {d}\n", .{lengthData});
+    pivot += getOffsetValue(length);
 
     return pivot;
 }
@@ -821,24 +853,14 @@ test "split_commands" {
     try testing.expect(commands[1] == null);
 }
 
-test "getLengthEncoding" {
-    var hello: [5]u8 = undefined;
-    @memcpy(&hello, "hello");
-    hello[0] = 0b00000100;
-    var n = try getEncodedString(&hello);
-    try testing.expectEqual(4, n.str.len);
-    try testing.expectEqual(1, n.skip);
-    try testing.expectEqualStrings("ello", n.str);
-    hello[0] = 0b01000000;
-    hello[1] = 0b00000001;
-    n = try getEncodedString(&hello);
-    try testing.expectEqual(1, n.str.len);
-    try testing.expectEqual(2, n.skip);
-    try testing.expectEqualStrings("l", n.str);
-    hello[0] = 0b11000000;
-    hello[1] = 64;
-    n = try getEncodedString(&hello);
-    try testing.expectEqual(1, n.str.len);
-    try testing.expectEqual(1, n.skip);
-    try testing.expectEqual(@as(u8, 64), n.str[1 - n.str.len]);
+test "loadDB" {
+    var kvs = KvArray.init(std.testing.allocator);
+    defer kvs.deinit();
+
+    const db = "/home/projects/codecrafters-redis-zig";
+    const dbfilename = "dump.rdb";
+    try loadDBFile(&kvs, @constCast(db), @constCast(dbfilename));
+
+    _ = try kvs.get(@constCast("mariete"));
+    _ = try kvs.get(@constCast("ula"));
 }
